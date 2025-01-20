@@ -159,7 +159,7 @@ class ReasoningBaseline(ReasoningBase):
 
 
 class MySimulationAgent(SimulationAgent):
-    """Participant's implementation of SimulationAgent."""
+    """Optimized implementation of SimulationAgent with split API calls."""
 
     def __init__(self, llm: LLMBase):
         """Initialize MySimulationAgent"""
@@ -175,90 +175,257 @@ class MySimulationAgent(SimulationAgent):
         self.task = task
         self.embedding = embedding_model
 
+    def analyze_user(self, user_info: str) -> str:
+        """Analyze user profile in a separate API call with text chunking"""
+        try:
+            # 限制输入长度，只取前1000字符的基本信息
+            user_info_brief = str(user_info)[:1000]
+
+            task = f'''
+            Analyze this partial Yelp user profile summary. Focus on:
+            - Rating style
+            - Review preferences
+            Keep it very brief.
+
+            Profile excerpt: {user_info_brief}
+            '''
+            messages = [{"role": "user", "content": task}]
+            user_analysis = self.reasoning(messages)
+            return user_analysis
+        except Exception as e:
+            logger.error(f"Error in analyze_user: {e}")
+            return "Average Yelp reviewer"  # 出错时返回默认值而不是空字符串
+
+    def analyze_business(self, business_info: str) -> str:
+        """Analyze business profile in a separate API call"""
+        try:
+            task = f'''
+            You are analyzing a business profile from Yelp. Provide a brief summary of:
+            - Key features and offerings
+            - Notable characteristics
+            - Main aspects customers might review
+            Keep it concise and factual.
+
+            Business: {business_info}
+            '''
+            messages = [{"role": "user", "content": task}]
+            business_analysis = self.reasoning(messages)
+            return business_analysis
+        except Exception as e:
+            logger.error(f"Error in analyze_business: {e}")
+            return ""
+
+    def process_reviews(self, reviews: list) -> str:
+        """Process a sample of reviews in a separate API call"""
+        if not reviews:
+            return ""
+
+        try:
+            # Take first review and limit length
+            sample_review = reviews[0]['text'][:300]  # Limit length to control tokens
+
+            task = f'''
+            Analyze this sample review and extract:
+            - Key points mentioned
+            - Tone and style
+            Keep the analysis brief.
+
+            Review: {sample_review}
+            '''
+            messages = [{"role": "user", "content": task}]
+            review_analysis = self.reasoning(messages)
+            return review_analysis
+        except Exception as e:
+            logger.error(f"Error in process_reviews: {e}")
+            return ""
+
+    def generate_review(self, user_summary: str, business_summary: str, review_context: str) -> str:
+        """Generate the final review based on analyzed components"""
+        try:
+            task_description = f'''
+            You are writing a Yelp review based on these insights:
+
+            User Analysis: {user_summary[:500]}
+            Business Summary: {business_summary[:500]}
+            Review Context: {review_context[:500]}
+
+            Write a review that:
+            - Matches the user's typical style
+            - Focuses on key business aspects
+            - Has appropriate rating and engagement metrics
+
+            Format:
+            stars: [1.0-5.0]
+            useful: [count]
+            funny: [count] 
+            cool: [count]
+            review: [2-4 sentences]
+            '''
+
+            messages = [{"role": "user", "content": task_description}]
+            return self.reasoning(messages)
+        except Exception as e:
+            logger.error(f"Error in generate_review: {e}")
+            return ""
+
     def workflow(self):
         """
-        Simulate user behavior
+        Execute the review simulation with memory module integration
         Returns:
             tuple: (star (float), useful (float), funny (float), cool (float), review_text (str))
         """
         try:
-            plan = self.planning(task_description=self.task)
+            # Basic info gathering
+            user = str(self.interaction_tool.get_user(user_id=self.task['user_id']))
+            business = str(self.interaction_tool.get_item(item_id=self.task['item_id']))
 
-            for sub_task in plan:
-                if 'user' in sub_task['description']:
-                    user = str(self.interaction_tool.get_user(user_id=self.task['user_id']))
-                elif 'business' in sub_task['description']:
-                    business = str(self.interaction_tool.get_item(item_id=self.task['item_id']))
+            # Get real review data for comparison
+            real_reviews = self.interaction_tool.get_reviews(
+                user_id=self.task['user_id'],
+                item_id=self.task['item_id']
+            )
 
+            logger.info("\n====== Input Data ======")
+            logger.info(f"User ID: {self.task['user_id']}")
+            logger.info(f"Business ID: {self.task['item_id']}")
+
+            # Get all relevant reviews
             reviews_item = self.interaction_tool.get_reviews(item_id=self.task['item_id'])
-            for review in reviews_item:
-                review_text = review['text']
-                self.memory(f'review: {review_text}')
-
             reviews_user = self.interaction_tool.get_reviews(user_id=self.task['user_id'])
-            review_similar = self.memory(f'{reviews_user[0]["text"]}')
 
+            # Add reviews to memory
+            logger.info("Adding reviews to memory...")
+            if reviews_item:
+                for review in reviews_item[:5]:  # Only use recent 5 reviews
+                    self.memory(f"review: {review['text']}")
+
+            if reviews_user:
+                for review in reviews_user[:3]:  # Only use recent 3 user reviews
+                    self.memory(f"review: {review['text']}")
+
+            # User Analysis
+            user_info_brief = str(user)[:1000]
+            task = f'''
+            Analyze this Yelp user's reviewing style briefly.
+            Profile: {user_info_brief}
+            Focus only on: typical ratings, writing style, and preferences.
+            Keep response under 100 words.
+            '''
+            messages = [{"role": "user", "content": task}]
+            user_summary = self.reasoning(messages)
+
+            # Business Analysis
+            business_info_brief = str(business)[:1000]
+            task = f'''
+            Analyze this business profile briefly.
+            Business: {business_info_brief}
+            Focus only on: key features and main review points.
+            Keep response under 100 words.
+            '''
+            messages = [{"role": "user", "content": task}]
+            business_summary = self.reasoning(messages)
+
+            # Retrieve similar reviews from memory
+            logger.info("Retrieving similar reviews from memory...")
+            similar_reviews = self.memory(str(business))
+
+            # Generate Final Review
             task_description = f'''
-            You are a real human user on Yelp, a platform for crowd-sourced business reviews. Here is your Yelp profile and review history: {user}
+            Write a Yelp review following EXACTLY this format:
 
-            You need to write a review for this business: {business}
+            stars: [rating between 1.0 and 5.0]
+            useful: [number between 0 and 3]
+            funny: [number between 0 and 1]
+            cool: [number between 0 and 2]
+            review: [Your detailed review here]
 
-            Others have reviewed this business before: {review_similar}
-
-            Please analyze the following aspects carefully:
-            1. Based on your user profile and review style, what rating would you give this business? Remember that many users give 5-star ratings for excellent experiences that exceed expectations, and 1-star ratings for very poor experiences that fail to meet basic standards.
-            2. Given the business details and your past experiences, what specific aspects would you comment on? Focus on the positive aspects that make this business stand out or negative aspects that severely impact the experience.
-            3. Consider how other users might engage with your review in terms of:
-            - Useful: How informative and helpful is your review?
-            - Funny: Does your review have any humorous or entertaining elements?
-            - Cool: Is your review particularly insightful or praiseworthy?
+            Context:
+            - User style: {user_summary[:200]}
+            - Business info: {business_summary[:200]}
+            - Similar reviews: {similar_reviews[:300]}
 
             Requirements:
-            - Star rating must be one of: 1.0, 2.0, 3.0, 4.0, 5.0
-            - If the business meets or exceeds expectations in key areas, consider giving a 5-star rating
-            - If the business fails significantly in key areas, consider giving a 1-star rating
-            - Review text should be 2-4 sentences, focusing on your personal experience and emotional response
-            - Useful/funny/cool counts should be non-negative integers that reflect likely user engagement
-            - Maintain consistency with your historical review style and rating patterns
-            - Focus on specific details about the business rather than generic comments
-            - Be generous with ratings when businesses deliver quality service and products
-            - Be critical when businesses fail to meet basic standards
-
-            Format your response exactly as follows:
-            stars: [your rating]
-            useful: [count]
-            funny: [count] 
-            cool: [count]
-            review: [your review]
+            1. Review MUST be 2-4 sentences long and include specific details
+            2. Focus on aspects mentioned in similar reviews
+            3. Match user's typical style and rating patterns
+            4. Keep engagement metrics realistic (most reviews have 0-3 useful votes)
+            5. Write review directly after "review:", no line breaks
+            6. Base rating mainly on similar reviews and user's typical patterns
             '''
 
-            result = self.reasoning(task_description)
+            messages = [{"role": "user", "content": task_description}]
+            result = self.reasoning(messages)
+
+            logger.info("\n====== Generated Review ======")
+            logger.debug(f"Raw generation result:\n{result}")
 
             try:
-                stars_line = [line for line in result.split('\n') if 'stars:' in line][0]
-                useful_line = [line for line in result.split('\n') if 'useful:' in line][0]
-                funny_line = [line for line in result.split('\n') if 'funny:' in line][0]
-                cool_line = [line for line in result.split('\n') if 'cool:' in line][0]
-                review_line = [line for line in result.split('\n') if 'review:' in line][0]
-            except:
-                print('Error:', result)
+                # Parse result with improved error handling
+                lines = result.strip().split('\n')
+                parsed_result = {}
+                current_field = None
 
-            stars = float(stars_line.split(':')[1].strip())
-            useful = float(useful_line.split(':')[1].strip())
-            funny = float(funny_line.split(':')[1].strip())
-            cool = float(cool_line.split(':')[1].strip())
-            review_text = review_line.split(':')[1].strip()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
 
-            if len(review_text) > 512:
-                review_text = review_text[:512]
+                    # Check for field markers
+                    for field in ['stars:', 'useful:', 'funny:', 'cool:', 'review:']:
+                        if line.lower().startswith(field):
+                            current_field = field[:-1]  # Remove the colon
+                            value = line[len(field):].strip()
+                            parsed_result[current_field] = value
+                            break
+                    else:
+                        # If no field marker found and we're in review field, append to review
+                        if current_field == 'review' and parsed_result.get('review'):
+                            parsed_result['review'] += ' ' + line
 
-            return stars, useful, funny, cool, review_text
+                # Validate and convert values with more realistic limits
+                stars = float(parsed_result.get('stars', '3.0'))
+                useful = float(parsed_result.get('useful', '0'))
+                funny = float(parsed_result.get('funny', '0'))
+                cool = float(parsed_result.get('cool', '0'))
+                review_text = parsed_result.get('review', 'No review content provided.').strip()
+
+                # Enforce realistic limits
+                stars = max(1.0, min(5.0, stars))
+                useful = max(0, min(3, useful))  # More realistic useful limit
+                funny = max(0, min(1, funny))  # More realistic funny limit
+                cool = max(0, min(2, cool))  # More realistic cool limit
+
+                if len(review_text) > 512:
+                    review_text = review_text[:512]
+
+                # Log generated review
+                logger.info(f"Stars: {stars}")
+                logger.info(f"Useful: {useful}")
+                logger.info(f"Funny: {funny}")
+                logger.info(f"Cool: {cool}")
+                logger.info(f"Review: {review_text}")
+
+                # Print real review for comparison
+                if real_reviews:
+                    logger.info("\n====== Real Review ======")
+                    real_review = real_reviews[0]
+                    logger.info(f"Stars: {real_review.get('stars', 0.0)}")
+                    logger.info(f"Useful: {real_review.get('useful', 0)}")
+                    logger.info(f"Funny: {real_review.get('funny', 0)}")
+                    logger.info(f"Cool: {real_review.get('cool', 0)}")
+                    logger.info(f"Review: {real_review.get('text', '')}")
+
+                logger.info("\n====== End of Comparison ======\n")
+                return stars, useful, funny, cool, review_text
+
+            except Exception as e:
+                logger.error(f"Error parsing generated review: {e}")
+                logger.error(f"Raw result: {result}")
+                return 3.0, 0.0, 0.0, 0.0, "Error processing review."
+
         except Exception as e:
-            print(f"Error in workflow: {e}")
-            return 0.0, 0.0, 0.0, 0.0, ""
-
-
-
+            logger.error(f"Error in workflow: {e}")
+            return 3.0, 0.0, 0.0, 0.0, "Error in review generation process."
 
 def main(batch_size: int = 50, max_tasks: int = None):
     """
@@ -428,5 +595,5 @@ def save_results(simulated_data, real_data, checkpoint):
 
 if __name__ == "__main__":
     # 可以通过参数控制批量大小和最大任务数
-    all_simulated_data, all_real_data = main(batch_size=50, max_tasks=1)
+    all_simulated_data, all_real_data = main(batch_size=3, max_tasks=5)
 
