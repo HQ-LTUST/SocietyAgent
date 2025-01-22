@@ -1,113 +1,40 @@
-import json
 import logging
 import numpy as np
 from typing import List, Dict, Union
-from dataclasses import dataclass
 from nltk.sentiment import SentimentIntensityAnalyzer
-from transformers import pipeline
 from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 from scipy.spatial import distance
 import torch
 import nltk
+from dataclasses import dataclass
 
-
-def ensure_nltk_data():
-    """Ensure NLTK data is available"""
-    try:
-        nltk.data.find('sentiment/vader_lexicon.zip')
-    except LookupError:
-        logging.warning("VADER lexicon not found, downloading...")
-        nltk.download('vader_lexicon', quiet=True)
-
-
-# Check NLTK data availability at import time
-ensure_nltk_data()
+# 配置日志
+logger = logging.getLogger("websocietysimulator")
 
 
 @dataclass
-class RecommendationMetrics:
-    top_1_hit_rate: float
-    top_3_hit_rate: float
-    top_5_hit_rate: float
-    average_hit_rate: float
-    total_scenarios: int
-    top_1_hits: int
-    top_3_hits: int
-    top_5_hits: int
+class EvaluationMetrics:
+    """存储评估指标的数据类"""
+    preference_estimation: float  # 偏好估计（与第一版保持一致）
+    review_generation: float  # 评论生成总分
+    overall_quality: float  # 整体质量
+    sentiment_error: float  # 情感分析误差
+    emotion_error: float  # 情绪分类误差
+    topic_error: float  # 主题相似度误差
 
 
-@dataclass
-class SimulationMetrics:
-    preference_estimation: float
-    review_generation: float
-    overall_quality: float
-
-
-class BaseEvaluator:
-    """Base class for evaluation tools"""
-
-    def __init__(self):
-        self.metrics_history: List[Union[RecommendationMetrics, SimulationMetrics]] = []
-
-    def save_metrics(self, metrics: Union[RecommendationMetrics, SimulationMetrics]):
-        """Save metrics to history"""
-        self.metrics_history.append(metrics)
-
-    def get_metrics_history(self):
-        """Get all historical metrics"""
-        return self.metrics_history
-
-
-class RecommendationEvaluator(BaseEvaluator):
-    """Evaluator for recommendation tasks"""
-
-    def __init__(self):
-        super().__init__()
-        self.n_values = [1, 3, 5]  # 预定义的n值数组
-
-    def calculate_hr_at_n(
-            self,
-            ground_truth: List[str],
-            predictions: List[List[str]]
-    ) -> RecommendationMetrics:
-        """Calculate Hit Rate at different N values"""
-        total = len(ground_truth)
-        hits = {n: 0 for n in self.n_values}
-
-        for gt, pred in zip(ground_truth, predictions):
-            for n in self.n_values:
-                if gt in pred[:n]:
-                    hits[n] += 1
-
-        top_1_hit_rate = hits[1] / total if total > 0 else 0
-        top_3_hit_rate = hits[3] / total if total > 0 else 0
-        top_5_hit_rate = hits[5] / total if total > 0 else 0
-        average_hit_rate = (top_1_hit_rate + top_3_hit_rate + top_5_hit_rate) / 3
-        metrics = RecommendationMetrics(
-            top_1_hit_rate=top_1_hit_rate,
-            top_3_hit_rate=top_3_hit_rate,
-            top_5_hit_rate=top_5_hit_rate,
-            average_hit_rate=average_hit_rate,
-            total_scenarios=total,
-            top_1_hits=hits[1],
-            top_3_hits=hits[3],
-            top_5_hits=hits[5]
-        )
-
-        self.save_metrics(metrics)
-        return metrics
-
-
-class SimulationEvaluator(BaseEvaluator):
-    """Evaluator for simulation tasks"""
-
+class UserModelingEvaluator:
     def __init__(self, device: str = "auto"):
-        super().__init__()
+        """初始化评估器
+        Args:
+            device: 使用的设备，可选 "auto", "cpu", "gpu"
+        """
         self.device = self._get_device(device)
-
-        pipeline_device = self.device
         st_device = "cuda" if self.device == 0 else "cpu"
+        pipeline_device = self.device
 
+        # 初始化评估模型（与第一版保持一致）
         self.sia = SentimentIntensityAnalyzer()
         self.emotion_classifier = pipeline(
             "text-classification",
@@ -115,127 +42,168 @@ class SimulationEvaluator(BaseEvaluator):
             top_k=5,
             device=pipeline_device
         )
-        self.topic_model = SentenceTransformer(
-            'paraphrase-MiniLM-L6-v2',
-            device=st_device
-        )
+        self.topic_model = SentenceTransformer('paraphrase-MiniLM-L6-v2', device=st_device)
+
+        # 确保下载必要的NLTK数据
+        try:
+            nltk.data.find('sentiment/vader_lexicon.zip')
+        except LookupError:
+            nltk.download('vader_lexicon', quiet=True)
 
     def _get_device(self, device: str) -> int:
-        """Parse device from string"""
+        """确定运行设备"""
         if device == "gpu":
-            if torch.cuda.is_available():
-                return 0  # GPU
-            else:
-                logging.warning("GPU is not available, falling back to CPU")
-                return -1  # CPU
+            return 0 if torch.cuda.is_available() else -1
         elif device == "cpu":
-            return -1  # CPU
+            return -1
         elif device == "auto":
             return 0 if torch.cuda.is_available() else -1
         else:
-            raise ValueError("Device type must be 'cpu', 'gpu' or 'auto'")
+            raise ValueError("Device must be 'cpu', 'gpu' or 'auto'")
 
-    def calculate_metrics(
+    def calculate_preference_estimation(
             self,
-            simulated_data: List[Dict],
-            real_data: List[Dict]
-    ) -> SimulationMetrics:
-        """Calculate all simulation metrics"""
-        # Calculate star error
-        simulated_stars = [item['stars'] for item in simulated_data]
-        real_stars = [item['stars'] for item in real_data]
+            simulated_ratings: List[float],
+            real_ratings: List[float]
+    ) -> float:
+        """计算偏好估计（与第一版保持一致）"""
         star_error = 0
-        for sim_star, real_star in zip(simulated_stars, real_stars):
-            if sim_star > 5:
-                sim_star = 5
-            elif sim_star < 0:
-                sim_star = 0
+        for sim_star, real_star in zip(simulated_ratings, real_ratings):
+            # 确保评分在0-5范围内
+            sim_star = np.clip(sim_star, 0, 5)
             star_error += abs(sim_star - real_star) / 5
-        star_error = star_error / len(real_stars)
-        preference_estimation = 1 - star_error
 
-        # Calculate review metrics
-        simulated_reviews = [item['review'] for item in simulated_data]
-        real_reviews = [item['review'] for item in real_data]
-        review_details = self._calculate_review_metrics(
-            simulated_reviews,
-            real_reviews
-        )
-
-        sentiment_error = review_details['sentiment_error']
-        emotion_error = review_details['emotion_error']
-        topic_error = review_details['topic_error']
-        review_generation = 1 - (sentiment_error * 0.25 + emotion_error * 0.25 + topic_error * 0.5)
-        overall_quality = (preference_estimation + review_generation) / 2
-
-        metrics = SimulationMetrics(
-            preference_estimation=preference_estimation,
-            review_generation=review_generation,
-            overall_quality=overall_quality
-        )
-
-        self.save_metrics(metrics)
-        return metrics
-
-    def _calculate_review_metrics(
-            self,
-            simulated_reviews: List[str],
-            real_reviews: List[str]
-    ) -> Dict[str, float]:
-        """Calculate detailed review metrics between two texts"""
-        # sentiment analysis
-        sentiment_error = []
-        emotion_error = []
-        topic_error = []
-        for simulated_review, real_review in zip(simulated_reviews, real_reviews):
-            # sentiment analysis
-            sentiment1 = self.sia.polarity_scores(simulated_review)['compound']
-            sentiment2 = self.sia.polarity_scores(real_review)['compound']
-            sentiment_error_single = abs(sentiment1 - sentiment2) / 2
-            sentiment_error.append(sentiment_error_single)
-
-            # Topic analysis
-            embeddings = self.topic_model.encode([simulated_review, real_review])
-            topic_error_single = distance.cosine(embeddings[0], embeddings[1]) / 2
-            topic_error.append(topic_error_single)
-
-        # Emotion analysis
-        for i in range(len(simulated_reviews)):
-            if len(simulated_reviews[i]) > 300:
-                simulated_reviews[i] = simulated_reviews[i][:300]
-            if len(real_reviews[i]) > 300:
-                real_reviews[i] = real_reviews[i][:300]
-        simulated_emotions = self.emotion_classifier(simulated_reviews)
-        real_emotions = self.emotion_classifier(real_reviews)
-        for sim_emotion, real_emotion in zip(simulated_emotions, real_emotions):
-            emotion_error_single = self._calculate_emotion_error(sim_emotion, real_emotion)
-            emotion_error.append(emotion_error_single)
-
-        sentiment_error = np.mean(sentiment_error)
-        emotion_error = np.mean(emotion_error)
-        topic_error = np.mean(topic_error)
-        return {
-            'sentiment_error': sentiment_error,
-            'emotion_error': emotion_error,
-            'topic_error': topic_error,
-        }
+        star_error = star_error / len(real_ratings)
+        return 1 - star_error
 
     def _calculate_emotion_error(
             self,
             emotions1: List[Dict],
             emotions2: List[Dict]
     ) -> float:
-        """Calculate similarity between two emotion distributions"""
-        # Convert emotions to vectors
+        """计算情绪分布的相似度（与第一版保持一致）"""
         emotion_dict1 = {e['label']: e['score'] for e in emotions1}
         emotion_dict2 = {e['label']: e['score'] for e in emotions2}
 
-        # Get all unique emotions
         all_emotions = set(emotion_dict1.keys()) | set(emotion_dict2.keys())
 
-        # Create vectors
         vec1 = np.array([emotion_dict1.get(e, 0) for e in all_emotions])
         vec2 = np.array([emotion_dict2.get(e, 0) for e in all_emotions])
 
-        # Calculate emotion error
         return float(np.mean(np.abs(vec1 - vec2)))
+
+    def calculate_review_metrics(
+            self,
+            simulated_reviews: List[str],
+            real_reviews: List[str]
+    ) -> Dict[str, float]:
+        """计算评论指标（与第一版保持一致）"""
+        sentiment_error = []
+        emotion_error = []
+        topic_error = []
+
+        # 处理情绪分析（截断过长的评论）
+        truncated_sim_reviews = [
+            review[:300] if len(review) > 300 else review
+            for review in simulated_reviews
+        ]
+        truncated_real_reviews = [
+            review[:300] if len(review) > 300 else review
+            for review in real_reviews
+        ]
+
+        simulated_emotions = self.emotion_classifier(truncated_sim_reviews)
+        real_emotions = self.emotion_classifier(truncated_real_reviews)
+
+        for i, (sim_review, real_review) in enumerate(zip(simulated_reviews, real_reviews)):
+            # 情感分析
+            sentiment1 = self.sia.polarity_scores(sim_review)['compound']
+            sentiment2 = self.sia.polarity_scores(real_review)['compound']
+            sentiment_error.append(abs(sentiment1 - sentiment2) / 2)
+
+            # 主题分析
+            embeddings = self.topic_model.encode([sim_review, real_review])
+            topic_error.append(distance.cosine(embeddings[0], embeddings[1]) / 2)
+
+            # 情绪分析
+            emotion_error_single = self._calculate_emotion_error(
+                simulated_emotions[i],
+                real_emotions[i]
+            )
+            emotion_error.append(emotion_error_single)
+
+        return {
+            'sentiment_error': float(np.mean(sentiment_error)),
+            'emotion_error': float(np.mean(emotion_error)),
+            'topic_error': float(np.mean(topic_error))
+        }
+
+    def evaluate(
+            self,
+            simulated_data: List[Dict],
+            real_data: List[Dict]
+    ) -> EvaluationMetrics:
+        """评估整体性能"""
+        try:
+            # 提取评分和评论
+            simulated_ratings = [item['stars'] for item in simulated_data]
+            real_ratings = [item['stars'] for item in real_data]
+            simulated_reviews = [item['review'] for item in simulated_data]
+            real_reviews = [item['review'] for item in real_data]
+
+            # 1. 计算偏好估计
+            preference_estimation = self.calculate_preference_estimation(
+                simulated_ratings,
+                real_ratings
+            )
+
+            # 2. 计算评论相关指标
+            review_metrics = self.calculate_review_metrics(
+                simulated_reviews,
+                real_reviews
+            )
+
+            # 3. 计算评论生成得分（与第一版保持一致）
+            review_generation = 1 - (
+                    review_metrics['sentiment_error'] * 0.25 +
+                    review_metrics['emotion_error'] * 0.25 +
+                    review_metrics['topic_error'] * 0.5
+            )
+
+            # 4. 计算整体质量分数
+            overall_quality = (preference_estimation + review_generation) / 2
+
+            return EvaluationMetrics(
+                preference_estimation=preference_estimation,
+                review_generation=review_generation,
+                overall_quality=overall_quality,
+                sentiment_error=review_metrics['sentiment_error'],
+                emotion_error=review_metrics['emotion_error'],
+                topic_error=review_metrics['topic_error']
+            )
+
+        except Exception as e:
+            logger.error(f"Evaluation error: {str(e)}")
+            raise
+
+
+# 使用示例
+if __name__ == "__main__":
+    evaluator = UserModelingEvaluator()
+    # 示例数据
+    simulated_data = [
+        {"stars": 4.0, "review": "Great product, really enjoyed it!"},
+        {"stars": 3.5, "review": "Pretty good but could be better."}
+    ]
+    real_data = [
+        {"stars": 4.5, "review": "Excellent product, highly recommend!"},
+        {"stars": 3.0, "review": "It's okay, not the best."}
+    ]
+
+    metrics = evaluator.evaluate(simulated_data, real_data)
+    print(f"Preference Estimation: {metrics.preference_estimation:.4f}")
+    print(f"Review Generation Score: {metrics.review_generation:.4f}")
+    print(f"Overall Quality: {metrics.overall_quality:.4f}")
+    print(f"Sentiment Error: {metrics.sentiment_error:.4f}")
+    print(f"Emotion Error: {metrics.emotion_error:.4f}")
+    print(f"Topic Error: {metrics.topic_error:.4f}")
